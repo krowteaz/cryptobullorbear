@@ -1,10 +1,10 @@
-# Crypto Bull or Bear — v6 (Coin-Specific News)
+# Crypto Bull or Bear — v6 Lite (Fast)
 
-**New in v6**
-- Coin-specific news using **CryptoNews API** (`tickers=SYMBOL`) or **NewsAPI.org** (`"Name" OR TICKER`), with RSS fallback filtered by coin.
-- Sentiment influences AI **entry/target/stop** suggestions.
-- Candlesticks (green/red) + high/low trend lines.
-- XGBoost predictor, backtest, metrics.
+**Optimized for speed**
+- Cached per-coin XGBoost model (trained once, then reused).
+- Dark theme, candlestick chart first, instant prediction.
+- Coin-specific news loads asynchronously in the background.
+- Fast auto-refresh option (10s).
 
 ## Run
 ```bash
@@ -15,6 +15,10 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run app_fast.py
 ```
-Enter optional API keys in the sidebar (CryptoNews or NewsAPI) for better coin-specific headlines.
+
+## Notes
+- The first run per coin/currency/lookback will train a lightweight model and cache it to `model_cache/…`.
+- News uses RSS (CoinDesk, CoinTelegraph, The Block) filtered by coin **name or ticker**; you can extend to CryptoNews/NewsAPI easily.
+- Educational only. Not financial advice.
