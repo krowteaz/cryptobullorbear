@@ -1,10 +1,9 @@
-# Crypto Bull or Bear — v6 Lite (Fast)
+# Crypto Bull or Bear — v10 (Fast Mode)
 
-**Optimized for speed**
-- Cached per-coin XGBoost model (trained once, then reused).
-- Dark theme, candlestick chart first, instant prediction.
-- Coin-specific news loads asynchronously in the background.
-- Fast auto-refresh option (10s).
+**Built for speed**  
+- Fast Mode **default**: fewer UI updates, single progress bar, cached models, async fetching.
+- Optional **Minimal Chart** (line) for ultra-fast runs.
+- Keeps v9 features conceptually but trims per‑step UI overhead.
 
 ## Run
 ```bash
@@ -15,10 +14,9 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
-streamlit run app_fast.py
+streamlit run app.py
 ```
 
-## Notes
-- The first run per coin/currency/lookback will train a lightweight model and cache it to `model_cache/…`.
-- News uses RSS (CoinDesk, CoinTelegraph, The Block) filtered by coin **name or ticker**; you can extend to CryptoNews/NewsAPI easily.
-- Educational only. Not financial advice.
+**Tips**
+- Use **30–90 days** lookback for richer signals while staying quick.
+- If you want full progress visuals, toggle **Fast Mode** off.
