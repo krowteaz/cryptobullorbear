@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests, time, math, re
+import requests, time, math, re, smtplib, sqlite3, os
+from email.message import EmailMessage
 from datetime import datetime
 from typing import Tuple, List, Dict
 
@@ -11,6 +12,10 @@ from xgboost import XGBClassifier
 
 import plotly.graph_objects as go
 import feedparser
+
+LOG_DIR = "/mnt/data/logs"
+CSV_PATH = os.path.join(LOG_DIR, "signals.csv")
+DB_PATH = os.path.join(LOG_DIR, "signals.db")
 
 # ===================== CoinGecko Helpers =====================
 def cg_get(path, params=None, api_key=None, base_url="https://api.coingecko.com/api/v3", max_retries=5):
@@ -93,6 +98,13 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+def bollinger(series: pd.Series, window=20, num_std=2):
+    ma = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    upper = ma + num_std*std
+    lower = ma - num_std*std
+    return ma, upper, lower
+
 def build_features(df: pd.DataFrame):
     df = df.copy()
     df["ret"] = df["price"].pct_change()
@@ -153,7 +165,7 @@ def evaluate_model(model, X_test, y_test):
     report = classification_report(y_test, y_pred, target_names=["bearish","bullish"], zero_division=0)
     return acc, cm, report, y_prob, y_pred
 
-# ===================== Coin-Specific News =====================
+# ===================== Coin-Specific News (RSS filtered) =====================
 NEWS_RSS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -170,24 +182,6 @@ def contains_coin(text: str, coin_name: str, ticker: str) -> bool:
     if re.search(rf"\\b{re.escape(ticker.lower())}\\b", t):
         return True
     return False
-
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_coin_news_cryptonews(ticker: str, api_key: str, limit: int=20):
-    url = "https://cryptonews-api.com/api/v1"
-    params = {"tickers": ticker, "items": limit, "token": api_key}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data", [])
-
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_coin_news_newsapi(query: str, api_key: str, limit: int=20):
-    url = "https://newsapi.org/v2/everything"
-    params = {"q": query, "pageSize": limit, "language": "en", "sortBy": "publishedAt", "apiKey": api_key}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("articles", [])
 
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_coin_news_rss(coin_name: str, ticker: str, max_items=50):
@@ -229,7 +223,7 @@ def summarize_news_coin(items):
     top_neg = [it for s,it in scored if s<0][:3]
     return {"score": total, "trend": trend, "top_pos": top_pos, "top_neg": top_neg, "all": [it for _,it in scored]}
 
-# ===================== Entry/Exit Heuristics =====================
+# ===================== Entry/Exit & Risk Meter =====================
 def atr_like(series: pd.Series, window: int = 14):
     ret = series.pct_change()
     vol = ret.rolling(window).std().iloc[-1]
@@ -242,7 +236,15 @@ def swing_levels(df_ohlc: pd.DataFrame, lookback: int = 10):
     last_close = float(recent["close"].iloc[-1])
     return swing_low, swing_high, last_close
 
-def ai_suggestions(prob_bull: float, rsi_val: float, macd_hist: float, dfo: pd.DataFrame, news_score: float):
+def position_size_percent(prob_adj: float, vol_proxy: float, model_acc: float, cap_min=0.02, cap_max=0.1):
+    conf = (prob_adj - 0.5) * 2
+    conf = max(0.0, conf)
+    conf *= (0.5 + 0.5*model_acc)
+    vol_penalty = 1.0 / (1.0 + 10.0*vol_proxy)
+    size = cap_min + (cap_max - cap_min) * conf * vol_penalty
+    return float(min(cap_max, max(cap_min, size)))
+
+def ai_suggestions(prob_bull: float, rsi_val: float, macd_hist: float, dfo: pd.DataFrame, news_score: float, model_acc: float):
     swing_low, swing_high, last_close = swing_levels(dfo, lookback=min(20, len(dfo)))
     vol = atr_like(dfo["close"])
     buf = last_close * max(0.005, min(0.03, vol*1.5))
@@ -253,58 +255,170 @@ def ai_suggestions(prob_bull: float, rsi_val: float, macd_hist: float, dfo: pd.D
         entry = max(swing_low, last_close - buf)
         target = swing_high
         stop = min(swing_low * 0.99, last_close - 2*buf)
-        text = "Bullish setup with supportive news — consider buying pullbacks toward support."
-        tag = "buy"
+        tag = "buy"; expl = "Bullish setup with supportive news — consider buying pullbacks toward support."
     elif p_adj <= 0.4 and macd_hist <= 0:
         entry = min(swing_high, last_close + buf)
         target = swing_low
         stop = max(swing_high * 1.01, last_close + 2*buf)
-        text = "Bearish pressure and weak news — consider selling/hedging near resistance."
-        tag = "sell"
+        tag = "sell"; expl = "Bearish pressure and weak news — consider selling/hedging near resistance."
     else:
         entry = last_close
         target = swing_high if p_adj >= 0.5 else swing_low
         stop = swing_low if p_adj >= 0.5 else swing_high
-        text = "Mixed signals — wait for a cleaner break or reduce position size."
-        tag = "wait"
-    return {
-        "mood": tag,
-        "entry": float(entry),
-        "target": float(target),
-        "stop": float(stop),
-        "last": float(last_close),
-        "explain": text,
-        "context": {
-            "swing_low": swing_low, "swing_high": swing_high, "vol_proxy": vol,
-            "prob_bull_raw": float(prob_bull), "prob_bull_news_adjusted": float(p_adj),
-            "rsi": float(rsi_val), "macd_hist": float(macd_hist), "news_score": float(news_score)
-        }
+        tag = "wait"; expl = "Mixed signals — wait for a cleaner break or reduce position size."
+
+    size_pct = position_size_percent(p_adj, vol, model_acc, cap_min=0.02, cap_max=0.1)
+    return {"mood": tag, "entry": float(entry), "target": float(target), "stop": float(stop),
+            "last": float(last_close), "pos_size_pct": float(size_pct), "explain": expl,
+            "context": {"swing_low": swing_low, "swing_high": swing_high, "vol_proxy": vol,
+                        "prob_bull_raw": float(prob_bull), "prob_bull_news_adjusted": float(p_adj),
+                        "rsi": float(rsi_val), "macd_hist": float(macd_hist), "news_score": float(news_score),
+                        "model_acc": float(model_acc)}}
+
+# ===================== Alerts =====================
+def send_discord(webhook_url: str, content: str):
+    try:
+        r = requests.post(webhook_url, json={"content": content}, timeout=15)
+        return r.status_code, r.text[:200]
+    except Exception as e:
+        return -1, str(e)
+
+def send_telegram(bot_token: str, chat_id: str, message: str):
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        r = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=15)
+        return r.status_code, r.text[:200]
+    except Exception as e:
+        return -1, str(e)
+
+def send_email_alert(host, port, username, password, from_addr, to_addr, subject, body, use_tls=True):
+    try:
+        msg = EmailMessage()
+        msg["From"] = from_addr
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.set_content(body)
+        if use_tls:
+            with smtplib.SMTP(host, int(port)) as s:
+                s.starttls()
+                if username:
+                    s.login(username, password)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(host, int(port)) as s:
+                if username:
+                    s.login(username, password)
+                s.send_message(msg)
+        return 200, "sent"
+    except Exception as e:
+        return -1, str(e)
+
+def try_alerts(signal_str, ideas, coin_label, price, alert_opts: dict):
+    message = f"[{coin_label}] Signal: {signal_str}\nPrice: {price:.4f}\nEntry: {ideas['entry']:.4f}\nTarget: {ideas['target']:.4f}\nStop: {ideas['stop']:.4f}\nPos Size: {ideas['pos_size_pct']*100:.1f}%\nNote: {ideas['explain']}"
+    results = {}
+    if alert_opts.get("discord_webhook"):
+        code, text = send_discord(alert_opts["discord_webhook"], message)
+        results["discord"] = code
+    if alert_opts.get("tg_token") and alert_opts.get("tg_chat"):
+        code, text = send_telegram(alert_opts["tg_token"], alert_opts["tg_chat"], message)
+        results["telegram"] = code
+    if alert_opts.get("smtp_host") and alert_opts.get("smtp_to") and alert_opts.get("smtp_from"):
+        code, text = send_email_alert(
+            alert_opts.get("smtp_host"), alert_opts.get("smtp_port", 587),
+            alert_opts.get("smtp_user"), alert_opts.get("smtp_pass"),
+            alert_opts.get("smtp_from"), alert_opts.get("smtp_to"),
+            f"[{coin_label}] Signal: {signal_str}", message, use_tls=True
+        )
+        results["email"] = code
+    return results
+
+# ===================== Logging (CSV + SQLite) =====================
+def init_db(path=DB_PATH):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS alerts (
+            ts TEXT, coin TEXT, signal TEXT, price REAL, entry REAL, target REAL, stop REAL,
+            pos_size REAL, channel TEXT, result_code INTEGER, note TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS signals (
+            ts TEXT, coin TEXT, mood TEXT, prob REAL, rsi REAL, macd REAL, news REAL, model_acc REAL
+        )""")
+        conn.commit()
+
+def log_alert(coin, signal, price, ideas, results):
+    ts = datetime.utcnow().isoformat()
+    # CSV
+    row = {
+        "ts": ts, "coin": coin, "signal": signal, "price": price,
+        "entry": ideas["entry"], "target": ideas["target"], "stop": ideas["stop"],
+        "pos_size": ideas["pos_size_pct"], "channels": "|".join(results.keys() or []),
+        "codes": "|".join(str(v) for v in results.values() or [])
     }
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if not os.path.exists(CSV_PATH):
+        pd.DataFrame([row]).to_csv(CSV_PATH, index=False)
+    else:
+        pd.DataFrame([row]).to_csv(CSV_PATH, mode="a", header=False, index=False)
+    # SQLite
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        for ch, code in results.items():
+            conn.execute("INSERT INTO alerts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (ts, coin, signal, float(price), float(ideas["entry"]), float(ideas["target"]),
+                          float(ideas["stop"]), float(ideas["pos_size_pct"]), ch, int(code), ideas["explain"]))
+        conn.commit()
+
+def log_signal(coin, mood, prob, rsi, macd, news, model_acc):
+    ts = datetime.utcnow().isoformat()
+    init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?)",
+                     (ts, coin, mood, float(prob), float(rsi), float(macd), float(news), float(model_acc)))
+        conn.commit()
+    # Append to CSV as well (optional)
+    row = {"ts": ts, "coin": coin, "mood": mood, "prob": prob, "rsi": rsi, "macd": macd, "news": news, "model_acc": model_acc}
+    sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
+    if not os.path.exists(sig_csv):
+        pd.DataFrame([row]).to_csv(sig_csv, index=False)
+    else:
+        pd.DataFrame([row]).to_csv(sig_csv, mode="a", header=False, index=False)
 
 # ===================== UI =====================
-st.set_page_config(page_title="Crypto Bull or Bear • v6", page_icon="📈", layout="wide")
-st.title("📈 Crypto Bull or Bear — Coin-Specific News + Signals (v6)")
-st.caption("Educational demo. Uses CoinGecko + XGBoost + coin-specific news sentiment. Not financial advice.")
+st.set_page_config(page_title="Crypto Bull or Bear • v8", page_icon="📈", layout="wide")
+st.title("📈 Crypto Bull or Bear — Watchlist + Logs + Test Alerts (v8)")
+st.caption("Educational demo. Uses CoinGecko + XGBoost + coin-specific news. Not financial advice.")
 
 with st.sidebar:
-    st.header("Data Sources")
-    api_key = st.text_input("CoinGecko API Key (optional)", type="password")
+    st.header("CoinGecko")
+    api_key = st.text_input("API Key (optional)", type="password")
     base_url = st.selectbox("CG API Base", ["https://api.coingecko.com/api/v3", "https://pro-api.coingecko.com/api/v3"], index=0)
-    st.markdown("---")
-    news_key_crn = st.text_input("CryptoNews API Key (optional)", type="password")
-    news_key_napi = st.text_input("NewsAPI.org Key (optional)", type="password")
-    st.divider()
 
-    st.header("Symbol & Window")
-    coin_query = st.text_input("Search coin", value="bitcoin")
-    if st.button("Search"):
-        try:
-            results = cg_search_coins(coin_query, api_key=api_key, base_url=base_url)
-            st.session_state["search_results"] = [(c.get("id"), f"{c.get('name')} ({c.get('symbol')})") for c in results[:20]]
-        except Exception as e:
-            st.error(f"Search error: {e}")
-    options = st.session_state.get("search_results", [("bitcoin","Bitcoin (btc)")])
-    coin_id = st.selectbox("CoinGecko ID", options=[x[0] for x in options], format_func=lambda x: dict(options).get(x, x))
+    st.divider()
+    st.header("Watchlist")
+    coins_text = st.text_input("CoinGecko IDs (comma-separated)", value="bitcoin,ethereum,solana")
+    layout_choice = st.radio("Layout", ["Tabs","Stacked panels"], index=0)
+
+    st.divider()
+    st.header("Alerts")
+    discord_webhook = st.text_input("Discord Webhook URL")
+    tg_token = st.text_input("Telegram Bot Token")
+    tg_chat = st.text_input("Telegram Chat ID")
+    smtp_host = st.text_input("SMTP Host")
+    smtp_port = st.number_input("SMTP Port", value=587, step=1)
+    smtp_user = st.text_input("SMTP Username")
+    smtp_pass = st.text_input("SMTP Password", type="password")
+    smtp_from = st.text_input("From Email")
+    smtp_to = st.text_input("To Email")
+    if st.button("Send Test Alert"):
+        test_res = try_alerts("TEST", {"entry":0,"target":0,"stop":0,"pos_size_pct":0,"explain":"config test","last":0}, "TEST", 0.0, {
+            "discord_webhook": discord_webhook, "tg_token": tg_token, "tg_chat": tg_chat,
+            "smtp_host": smtp_host, "smtp_port": smtp_port, "smtp_user": smtp_user, "smtp_pass": smtp_pass,
+            "smtp_from": smtp_from, "smtp_to": smtp_to
+        })
+        st.write("Test results:", test_res)
+
+    st.divider()
+    st.header("Run")
     vs_currency = st.selectbox("Currency", ["usd","eur","php","jpy"], index=0)
     days_choice = st.selectbox("Lookback", ["7","14","30","90","180","365"], index=2)
     refresh = st.checkbox("Auto-refresh (60s)", value=False)
@@ -316,20 +430,26 @@ try:
 except Exception as e:
     st.error(f"Cannot reach CoinGecko API: {e}")
 
-st.info("Tip: Enter a CryptoNews or NewsAPI key for higher-quality, coin-filtered headlines. Otherwise RSS fallback filters by coin name/ticker.")
-
-def build_and_run():
+def render_coin_block(coin_id: str):
     df = fetch_market_chart(coin_id, vs_currency, days_choice, api_key=api_key, base_url=base_url)
     dfo = fetch_ohlc(coin_id, vs_currency, days_choice, api_key=api_key, base_url=base_url)
     if df.empty or len(df) < 120 or dfo.empty:
-        st.warning("Not enough price/OHLC data. Try a different lookback.")
+        st.warning(f"[{coin_id}] Not enough price/OHLC data.")
         return
 
     ticker, coin_name = fetch_coin_symbol(coin_id, api_key=api_key, base_url=base_url)
     ticker = ticker or coin_id.upper()
     coin_name = coin_name or coin_id
+    coin_label = f"{coin_name} ({ticker})"
 
-    st.subheader(f"Candlesticks for {coin_name} ({ticker}) — green up / red down")
+    # OHLC + overlays
+    dfo = dfo.copy()
+    dfo["ema_5"] = dfo["close"].ewm(span=5, adjust=False).mean()
+    dfo["ema_20"] = dfo["close"].ewm(span=20, adjust=False).mean()
+    ma20, bb_up, bb_dn = bollinger(dfo["close"], window=20, num_std=2)
+    dfo["bb_mid"] = ma20; dfo["bb_up"] = bb_up; dfo["bb_dn"] = bb_dn
+
+    st.subheader(coin_label)
     fig = go.Figure(data=[go.Candlestick(
         x=dfo["time"], open=dfo["open"], high=dfo["high"], low=dfo["low"], close=dfo["close"],
         increasing_line_color="green", decreasing_line_color="red",
@@ -338,89 +458,118 @@ def build_and_run():
     fig.update_layout(xaxis_rangeslider_visible=False, height=420, margin=dict(l=10,r=10,t=30,b=10))
     fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["high"].rolling(5).max(), mode="lines", name="High trend"))
     fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["low"].rolling(5).min(), mode="lines", name="Low trend"))
+    fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["ema_5"], mode="lines", name="EMA 5"))
+    fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["ema_20"], mode="lines", name="EMA 20"))
+    fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["bb_up"], mode="lines", name="BB Upper", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["bb_mid"], mode="lines", name="BB Mid", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=dfo["time"], y=dfo["bb_dn"], mode="lines", name="BB Lower", line=dict(dash="dot")))
+    cross_up = (dfo["ema_5"] > dfo["ema_20"]) & (dfo["ema_5"].shift(1) <= dfo["ema_20"].shift(1))
+    cross_dn = (dfo["ema_5"] < dfo["ema_20"]) & (dfo["ema_5"].shift(1) >= dfo["ema_20"].shift(1))
+    fig.add_trace(go.Scatter(x=dfo["time"][cross_up], y=dfo["close"][cross_up], mode="markers", name="Bullish X", marker_symbol="triangle-up", marker_size=10))
+    fig.add_trace(go.Scatter(x=dfo["time"][cross_dn], y=dfo["close"][cross_dn], mode="markers", name="Bearish X", marker_symbol="triangle-down", marker_size=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    left, right = st.columns([2,1], vertical_alignment="top")
+    # Signals
+    df_feat, feature_cols = build_features(df)
+    X_train, y_train, X_test, y_test, split_idx = time_series_split(df_feat, feature_cols, split_ratio=0.8)
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+    model = train_xgb(X_train_s, y_train, X_test_s, y_test)
+    acc, cm, report, y_prob, y_pred = evaluate_model(model, X_test_s, y_test)
 
-    with left:
-        st.subheader("Signals & Prediction")
-        df_feat, feature_cols = build_features(df)
-        X_train, y_train, X_test, y_test, split_idx = time_series_split(df_feat, feature_cols, split_ratio=0.8)
-        scaler = StandardScaler()
-        X_train_s = scaler.fit_transform(X_train)
-        X_test_s = scaler.transform(X_test)
-        model = train_xgb(X_train_s, y_train, X_test_s, y_test)
-        acc, cm, report, y_prob, y_pred = evaluate_model(model, X_test_s, y_test)
+    last_row = df_feat.iloc[[-1]][feature_cols].values
+    last_scaled = scaler.transform(last_row)
+    prob_bull = float(model.predict_proba(last_scaled)[0,1])
+    rsi_val = float(df_feat.iloc[-1]["rsi_14"])
+    macd_hist = float(df_feat.iloc[-1]["macd_hist"])
 
-        last_row = df_feat.iloc[[-1]][feature_cols].values
-        last_scaled = scaler.transform(last_row)
-        prob_bull = float(model.predict_proba(last_scaled)[0,1])
-        rsi_val = float(df_feat.iloc[-1]["rsi_14"])
-        macd_hist = float(df_feat.iloc[-1]["macd_hist"])
+    # News Sentiment (RSS filtered)
+    news_items = fetch_coin_news_rss(coin_name, ticker, max_items=60)
+    summary = summarize_news_coin(news_items)
 
-        st.metric("Model Accuracy (test)", f"{acc*100:.1f}%")
-        st.metric("Bullish Probability", f"{prob_bull*100:.1f}%")
-        st.metric("RSI(14)", f"{rsi_val:.1f}")
-        st.metric("MACD Hist", f"{macd_hist:.5f}")
+    st.metric("Bullish Probability", f"{prob_bull*100:.1f}%")
+    st.metric("RSI(14)", f"{rsi_val:.1f}")
+    st.metric("MACD Hist", f"{macd_hist:.5f}")
+    if summary["trend"] == "bullish":
+        st.success(f"News: BULLISH ({summary['score']:+d})")
+    elif summary["trend"] == "bearish":
+        st.error(f"News: BEARISH ({summary['score']:+d})")
+    else:
+        st.warning(f"News: NEUTRAL ({summary['score']:+d})")
 
-        with st.expander("Backtest vs Buy & Hold (Test)"):
-            df_sig = df_feat.copy()
-            df_sig.loc[split_idx:, "signal"] = np.where(y_pred==1, 1, -1)
-            df_sig["strategy_ret"] = df_sig["signal"].shift(1) * df_sig["ret"]
-            df_sig["equity"] = (1 + df_sig["strategy_ret"].fillna(0)).cumprod()
-            df_sig["bh_equity"] = (1 + df_sig["ret"].fillna(0)).cumprod()
-            st.line_chart(df_sig.set_index("time")[["equity","bh_equity"]])
-            st.dataframe(pd.DataFrame(cm, index=["Actual Bear","Actual Bull"], columns=["Pred Bear","Pred Bull"]), use_container_width=True)
-            st.code(report)
+    ideas = ai_suggestions(prob_bull, rsi_val, macd_hist, dfo, summary["score"], acc)
+    if ideas["mood"] == "buy":
+        st.success("Action: BUY / ADD")
+    elif ideas["mood"] == "sell":
+        st.error("Action: SELL / HEDGE")
+    else:
+        st.info("Action: WAIT / NEUTRAL")
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Entry", f"{ideas['entry']:.4f} {vs_currency.upper()}")
+    colB.metric("Target", f"{ideas['target']:.4f} {vs_currency.upper()}")
+    colC.metric("Stop", f"{ideas['stop']:.4f} {vs_currency.upper()}")
+    colD.metric("Pos Size", f"{ideas['pos_size_pct']*100:.1f}%")
 
-    with right:
-        st.subheader(f"News Sentiment — {coin_name} ({ticker})")
-        news_items = []
-        if news_key_crn:
-            try:
-                news_items = fetch_coin_news_cryptonews(ticker, news_key_crn, limit=20)
-                news_items = [{"source": n.get("source_name",""), "title": n.get("title",""), "summary": n.get("text",""), "link": n.get("news_url","")} for n in news_items]
-            except Exception as e:
-                st.warning(f"CryptoNews API error: {e}")
-        if not news_items and news_key_napi:
-            try:
-                arts = fetch_coin_news_newsapi(f'"{coin_name}" OR {ticker}', news_key_napi, limit=20)
-                news_items = [{"source": a.get("source",{}).get("name",""), "title": a.get("title",""), "summary": a.get("description",""), "link": a.get("url","")} for a in arts if contains_coin((a.get("title","")+" "+a.get("description","")), coin_name, ticker)]
-            except Exception as e:
-                st.warning(f"NewsAPI error: {e}")
-        if not news_items:
-            news_items = fetch_coin_news_rss(coin_name, ticker, max_items=50)
+    # Log current signal
+    log_signal(coin_label, ideas["mood"], prob_bull, rsi_val, macd_hist, summary["score"], acc)
 
-        summary = summarize_news_coin(news_items)
-        trend = summary["trend"]
-        score = summary["score"]
-        if trend == "bullish":
-            st.success(f"News trend: BULLISH (score {score:+d})")
-        elif trend == "bearish":
-            st.error(f"News trend: BEARISH (score {score:+d})")
-        else:
-            st.warning(f"News trend: NEUTRAL (score {score:+d})")
-        for it in (summary.get("top_pos", []) + summary.get("top_neg", []))[:6]:
-            st.write(f"• [{it['title']}]({it['link']})")
+    # Flip detection + alerts
+    key = f"last_signal_{coin_id}"
+    current_signal = ideas["mood"]
+    if key not in st.session_state:
+        st.session_state[key] = current_signal
+    flipped = (current_signal != st.session_state[key])
+    st.caption(f"Signal: **{current_signal.upper()}** {'(flipped)' if flipped else ''}")
+    if flipped and (discord_webhook or tg_token or (smtp_host and smtp_from and smtp_to)):
+        results = try_alerts(current_signal, ideas, coin_label, ideas['last'], {
+            "discord_webhook": discord_webhook, "tg_token": tg_token, "tg_chat": tg_chat,
+            "smtp_host": smtp_host, "smtp_port": smtp_port, "smtp_user": smtp_user, "smtp_pass": smtp_pass,
+            "smtp_from": smtp_from, "smtp_to": smtp_to
+        })
+        log_alert(coin_label, current_signal, ideas['last'], ideas, results)
+        st.toast(f"Alert sent for {coin_label}: {current_signal}", icon="🔔")
+        st.write("Alert results:", results)
+        st.session_state[key] = current_signal
 
-        st.subheader("AI Trade Suggestion")
-        ideas = ai_suggestions(prob_bull, rsi_val, macd_hist, dfo, summary["score"])
-        if ideas["mood"] == "buy":
-            st.success("Suggested Action: BUY / ADD")
-        elif ideas["mood"] == "sell":
-            st.error("Suggested Action: SELL / HEDGE")
-        else:
-            st.info("Suggested Action: WAIT / NEUTRAL")
+def render_logs():
+    st.subheader("📜 Logs")
+    # CSV signals summary
+    sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
+    if os.path.exists(sig_csv):
+        df = pd.read_csv(sig_csv)
+        st.dataframe(df.tail(200), use_container_width=True)
+    else:
+        st.info("No signal logs yet.")
+    if os.path.exists(DB_PATH):
+        with sqlite3.connect(DB_PATH) as conn:
+            dfA = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200", conn)
+            st.write("Alerts (latest 200)")
+            st.dataframe(dfA, use_container_width=True)
+    else:
+        st.info("No alert DB yet.")
 
-        st.metric("Entry (guide)", f"{ideas['entry']:.4f} {vs_currency.upper()}")
-        st.metric("Target", f"{ideas['target']:.4f} {vs_currency.upper()}")
-        st.metric("Stop", f"{ideas['stop']:.4f} {vs_currency.upper()}")
-        st.caption(ideas["explain"])
-        with st.expander("Context"):
-            st.json(ideas["context"])
+if st.button("Show Logs"):
+    render_logs()
+
+def run_watchlist():
+    coins = [c.strip() for c in coins_text.split(",") if c.strip()]
+    if not coins:
+        st.warning("Please enter at least one CoinGecko ID (e.g., bitcoin).")
+        return
+    if layout_choice == "Tabs":
+        tabs = st.tabs([c for c in coins])
+        for tab, coin in zip(tabs, coins):
+            with tab:
+                render_coin_block(coin)
+    else:
+        for coin in coins:
+            with st.container():
+                render_coin_block(coin)
+                st.divider()
 
 if run_btn:
-    build_and_run()
+    run_watchlist()
 
 if 'last_auto' not in st.session_state:
     st.session_state['last_auto'] = 0.0
