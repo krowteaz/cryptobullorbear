@@ -1,9 +1,10 @@
-# Crypto Bull or Bear — v10 (Fast Mode)
+# Crypto Bull or Bear — v9 (Unified Settings + Smart Search)
 
-**Built for speed**  
-- Fast Mode **default**: fewer UI updates, single progress bar, cached models, async fetching.
-- Optional **Minimal Chart** (line) for ultra-fast runs.
-- Keeps v9 features conceptually but trims per‑step UI overhead.
+**What’s new**
+- 🧭 **Unified Settings** in a single sidebar expander: API & Market, Watchlist & Display, Alerts, Performance.
+- 🔎 **Smarter coin search** with CoinGecko `/search`, multi-select builder, and saved selections.
+- ▶️ **One RUN button** triggers analysis on all selected coins with progress feedback.
+- ✅ Keeps v8 features: stacked/tabs layouts, alerts, logs (CSV + SQLite), EMA/Bollinger, coin-specific news, XGBoost predictor, risk meter.
 
 ## Run
 ```bash
@@ -18,5 +19,5 @@ streamlit run app.py
 ```
 
 **Tips**
-- Use **30–90 days** lookback for richer signals while staying quick.
-- If you want full progress visuals, toggle **Fast Mode** off.
+- Use the **Search** button to fetch live suggestions, tick the ones you want, then hit **RUN / REFRESH**.
+- Alerts fire on signal flips; test them with **Send Test Alert** inside Settings.
