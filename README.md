@@ -1,10 +1,10 @@
-# Crypto Bull or Bear — v5 (XGBoost + News + Candles)
+# Crypto Bull or Bear — v6 (Coin-Specific News)
 
-**New in v5**
-- 📰 **Crypto news sentiment** from CoinDesk, CoinTelegraph, The Block (RSS, no API key). Simple keyword-based score → bullish/bearish/neutral.
-- 🕯️ **Green/Red Candlesticks** using CoinGecko OHLC + high/low trend lines.
-- 🤖 **AI trade suggestions** (entry/target/stop) from model probability + RSI/MACD + swing levels.
-- ⚡ Same XGBoost predictor and backtests, CoinGecko without Enterprise interval.
+**New in v6**
+- Coin-specific news using **CryptoNews API** (`tickers=SYMBOL`) or **NewsAPI.org** (`"Name" OR TICKER`), with RSS fallback filtered by coin.
+- Sentiment influences AI **entry/target/stop** suggestions.
+- Candlesticks (green/red) + high/low trend lines.
+- XGBoost predictor, backtest, metrics.
 
 ## Run
 ```bash
@@ -17,9 +17,4 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
-> If xgboost install fails on Windows, try `pip install --only-binary=:all: xgboost`.
-
-## Notes
-- News sentiment is heuristic and for **education only**.
-- OHLC endpoint supports fixed day ranges (7, 14, 30, 90, 180, 365).
-- Suggestions are **not financial advice**.
+Enter optional API keys in the sidebar (CryptoNews or NewsAPI) for better coin-specific headlines.
