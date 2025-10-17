@@ -165,7 +165,7 @@ def evaluate_model(model, X_test, y_test):
     report = classification_report(y_test, y_pred, target_names=["bearish","bullish"], zero_division=0)
     return acc, cm, report, y_prob, y_pred
 
-# ===================== Coin-Specific News (RSS filtered) =====================
+# ===================== News (coin-filtered RSS) =====================
 NEWS_RSS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -275,7 +275,7 @@ def ai_suggestions(prob_bull: float, rsi_val: float, macd_hist: float, dfo: pd.D
                         "rsi": float(rsi_val), "macd_hist": float(macd_hist), "news_score": float(news_score),
                         "model_acc": float(model_acc)}}
 
-# ===================== Alerts =====================
+# ===================== Alerts & Logging =====================
 def send_discord(webhook_url: str, content: str):
     try:
         r = requests.post(webhook_url, json={"content": content}, timeout=15)
@@ -314,7 +314,7 @@ def send_email_alert(host, port, username, password, from_addr, to_addr, subject
         return -1, str(e)
 
 def try_alerts(signal_str, ideas, coin_label, price, alert_opts: dict):
-    message = f"[{coin_label}] Signal: {signal_str}\nPrice: {price:.4f}\nEntry: {ideas['entry']:.4f}\nTarget: {ideas['target']:.4f}\nStop: {ideas['stop']:.4f}\nPos Size: {ideas['pos_size_pct']*100:.1f}%\nNote: {ideas['explain']}"
+    message = f"[{coin_label}] Signal: {signal_str}\\nPrice: {price:.4f}\\nEntry: {ideas['entry']:.4f}\\nTarget: {ideas['target']:.4f}\\nStop: {ideas['stop']:.4f}\\nPos Size: {ideas['pos_size_pct']*100:.1f}%\\nNote: {ideas['explain']}"
     results = {}
     if alert_opts.get("discord_webhook"):
         code, text = send_discord(alert_opts["discord_webhook"], message)
@@ -332,7 +332,6 @@ def try_alerts(signal_str, ideas, coin_label, price, alert_opts: dict):
         results["email"] = code
     return results
 
-# ===================== Logging (CSV + SQLite) =====================
 def init_db(path=DB_PATH):
     os.makedirs(LOG_DIR, exist_ok=True)
     with sqlite3.connect(path) as conn:
@@ -347,7 +346,6 @@ def init_db(path=DB_PATH):
 
 def log_alert(coin, signal, price, ideas, results):
     ts = datetime.utcnow().isoformat()
-    # CSV
     row = {
         "ts": ts, "coin": coin, "signal": signal, "price": price,
         "entry": ideas["entry"], "target": ideas["target"], "stop": ideas["stop"],
@@ -359,7 +357,6 @@ def log_alert(coin, signal, price, ideas, results):
         pd.DataFrame([row]).to_csv(CSV_PATH, index=False)
     else:
         pd.DataFrame([row]).to_csv(CSV_PATH, mode="a", header=False, index=False)
-    # SQLite
     init_db()
     with sqlite3.connect(DB_PATH) as conn:
         for ch, code in results.items():
@@ -375,7 +372,6 @@ def log_signal(coin, mood, prob, rsi, macd, news, model_acc):
         conn.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?)",
                      (ts, coin, mood, float(prob), float(rsi), float(macd), float(news), float(model_acc)))
         conn.commit()
-    # Append to CSV as well (optional)
     row = {"ts": ts, "coin": coin, "mood": mood, "prob": prob, "rsi": rsi, "macd": macd, "news": news, "model_acc": model_acc}
     sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
     if not os.path.exists(sig_csv):
@@ -383,9 +379,9 @@ def log_signal(coin, mood, prob, rsi, macd, news, model_acc):
     else:
         pd.DataFrame([row]).to_csv(sig_csv, mode="a", header=False, index=False)
 
-# ===================== UI =====================
-st.set_page_config(page_title="Crypto Bull or Bear • v8", page_icon="📈", layout="wide")
-st.title("📈 Crypto Bull or Bear — Watchlist + Logs + Test Alerts (v8)")
+# ===================== UI (v9 Progress + Status) =====================
+st.set_page_config(page_title="Crypto Bull or Bear • v9", page_icon="📈", layout="wide")
+st.title("📈 Crypto Bull or Bear — Progress & Report Status (v9)")
 st.caption("Educational demo. Uses CoinGecko + XGBoost + coin-specific news. Not financial advice.")
 
 with st.sidebar:
@@ -424,32 +420,109 @@ with st.sidebar:
     refresh = st.checkbox("Auto-refresh (60s)", value=False)
     run_btn = st.button("Run / Refresh", type="primary")
 
+# Sidebar status area
+sb_status = st.sidebar.empty()
+sb_prog = st.sidebar.progress(0, text="Idle")
+
 try:
     _ = cg_ping(api_key=api_key, base_url=base_url)
     st.toast("CoinGecko OK ✅", icon="✅")
 except Exception as e:
     st.error(f"Cannot reach CoinGecko API: {e}")
 
-def render_coin_block(coin_id: str):
+def step_eta(step_idx, total_steps, start_ts):
+    # simple ETA assuming equal step cost; shows elapsed + rough remaining
+    now = time.time()
+    elapsed = now - start_ts
+    done_ratio = max(0.01, step_idx/total_steps)
+    est_total = elapsed / done_ratio
+    remaining = max(0.0, est_total - elapsed)
+    return elapsed, remaining
+
+def render_logs():
+    st.subheader("📜 Logs")
+    sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
+    if os.path.exists(sig_csv):
+        df = pd.read_csv(sig_csv)
+        st.dataframe(df.tail(200), use_container_width=True)
+    else:
+        st.info("No signal logs yet.")
+    if os.path.exists(DB_PATH):
+        with sqlite3.connect(DB_PATH) as conn:
+            dfA = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200", conn)
+            st.write("Alerts (latest 200)")
+            st.dataframe(dfA, use_container_width=True)
+    else:
+        st.info("No alert DB yet.")
+
+if st.button("Show Logs"):
+    render_logs()
+
+def render_coin_block(coin_id: str, start_ts: float, idx: int, total: int):
+    total_steps = 7  # fetch market, fetch ohlc, build feat, split/scale, train, evaluate, news
+    step = 0
+
+    main_status = st.empty()
+    main_prog = st.progress(0, text=f"[{coin_id}] Preparing…")
+
+    def update_status(msg):
+        nonlocal step
+        step += 1
+        elapsed, remaining = step_eta(step, total_steps, start_ts)
+        main_status.info(f"{msg}  ⏳ Elapsed: {elapsed:.1f}s • Est. remaining: {remaining:.1f}s")
+        p = int(100 * min(1.0, step/total_steps))
+        main_prog.progress(p, text=f"[{coin_id}] {msg} ({p}%)")
+        sb_prog.progress(int(100 * ((idx-1)/total + (step/total_steps)/total)), text=f"Running {idx}/{total}: {coin_id} — {msg}")
+        if elapsed > 15:
+            sb_status.warning("Processing is a bit slow — still running and completing the report…")
+
+    update_status("Fetching market prices")
     df = fetch_market_chart(coin_id, vs_currency, days_choice, api_key=api_key, base_url=base_url)
+    update_status("Fetching OHLC candles")
     dfo = fetch_ohlc(coin_id, vs_currency, days_choice, api_key=api_key, base_url=base_url)
     if df.empty or len(df) < 120 or dfo.empty:
-        st.warning(f"[{coin_id}] Not enough price/OHLC data.")
+        main_status.error("Not enough price/OHLC data. Try a different lookback.")
         return
 
+    update_status("Building features")
+    df_feat, feature_cols = build_features(df)
+    update_status("Splitting & scaling")
+    X_train, y_train, X_test, y_test, split_idx = time_series_split(df_feat, feature_cols, split_ratio=0.8)
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+    update_status("Training XGBoost model")
+    model = train_xgb(X_train_s, y_train, X_test_s, y_test)
+    update_status("Evaluating & predicting")
+    acc, cm, report, y_prob, y_pred = evaluate_model(model, X_test_s, y_test)
+    last_row = df_feat.iloc[[-1]][feature_cols].values
+    last_scaled = scaler.transform(last_row)
+    prob_bull = float(model.predict_proba(last_scaled)[0,1])
+    rsi_val = float(df_feat.iloc[-1]["rsi_14"])
+    macd_hist = float(df_feat.iloc[-1]["macd_hist"])
+
+    update_status("Collecting coin-specific news")
+    # coin label
     ticker, coin_name = fetch_coin_symbol(coin_id, api_key=api_key, base_url=base_url)
     ticker = ticker or coin_id.upper()
     coin_name = coin_name or coin_id
     coin_label = f"{coin_name} ({ticker})"
+    news_items = fetch_coin_news_rss(coin_name, ticker, max_items=60)
+    summary = summarize_news_coin(news_items)
 
-    # OHLC + overlays
+    # Completed
+    elapsed_total = time.time() - start_ts
+    main_status.success(f"Report completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (took {elapsed_total:.1f}s)")
+
+    # ---- Charts & panels ----
+    st.subheader(coin_label)
+    # Overlays
     dfo = dfo.copy()
     dfo["ema_5"] = dfo["close"].ewm(span=5, adjust=False).mean()
     dfo["ema_20"] = dfo["close"].ewm(span=20, adjust=False).mean()
     ma20, bb_up, bb_dn = bollinger(dfo["close"], window=20, num_std=2)
     dfo["bb_mid"] = ma20; dfo["bb_up"] = bb_up; dfo["bb_dn"] = bb_dn
 
-    st.subheader(coin_label)
     fig = go.Figure(data=[go.Candlestick(
         x=dfo["time"], open=dfo["open"], high=dfo["high"], low=dfo["low"], close=dfo["close"],
         increasing_line_color="green", decreasing_line_color="red",
@@ -469,104 +542,73 @@ def render_coin_block(coin_id: str):
     fig.add_trace(go.Scatter(x=dfo["time"][cross_dn], y=dfo["close"][cross_dn], mode="markers", name="Bearish X", marker_symbol="triangle-down", marker_size=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    # Signals
-    df_feat, feature_cols = build_features(df)
-    X_train, y_train, X_test, y_test, split_idx = time_series_split(df_feat, feature_cols, split_ratio=0.8)
-    scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s = scaler.transform(X_test)
-    model = train_xgb(X_train_s, y_train, X_test_s, y_test)
-    acc, cm, report, y_prob, y_pred = evaluate_model(model, X_test_s, y_test)
+    # Metrics & suggestion
+    left, right = st.columns([2,1], vertical_alignment="top")
+    with left:
+        st.subheader("Signals & Prediction")
+        st.metric("Model Accuracy (test)", f"{acc*100:.1f}%")
+        st.metric("Bullish Probability", f"{prob_bull*100:.1f}%")
+        st.metric("RSI(14)", f"{rsi_val:.1f}")
+        st.metric("MACD Hist", f"{macd_hist:.5f}")
+        with st.expander("Backtest vs Buy & Hold (Test)"):
+            df_sig = df_feat.copy()
+            df_sig.loc[split_idx:, "signal"] = np.where(y_pred==1, 1, -1)
+            df_sig["strategy_ret"] = df_sig["signal"].shift(1) * df_sig["ret"]
+            df_sig["equity"] = (1 + df_sig["strategy_ret"].fillna(0)).cumprod()
+            df_sig["bh_equity"] = (1 + df_sig["ret"].fillna(0)).cumprod()
+            st.line_chart(df_sig.set_index("time")[["equity","bh_equity"]])
+            st.dataframe(pd.DataFrame(cm, index=["Actual Bear","Actual Bull"], columns=["Pred Bear","Pred Bull"]), use_container_width=True)
+            st.code(report)
 
-    last_row = df_feat.iloc[[-1]][feature_cols].values
-    last_scaled = scaler.transform(last_row)
-    prob_bull = float(model.predict_proba(last_scaled)[0,1])
-    rsi_val = float(df_feat.iloc[-1]["rsi_14"])
-    macd_hist = float(df_feat.iloc[-1]["macd_hist"])
+    with right:
+        st.subheader("News & Suggestion")
+        if summary["trend"] == "bullish":
+            st.success(f"News: BULLISH ({summary['score']:+d})")
+        elif summary["trend"] == "bearish":
+            st.error(f"News: BEARISH ({summary['score']:+d})")
+        else:
+            st.warning(f"News: NEUTRAL ({summary['score']:+d})")
 
-    # News Sentiment (RSS filtered)
-    news_items = fetch_coin_news_rss(coin_name, ticker, max_items=60)
-    summary = summarize_news_coin(news_items)
+        ideas = ai_suggestions(prob_bull, rsi_val, macd_hist, dfo, summary["score"], acc)
+        if ideas["mood"] == "buy":
+            st.success("Action: BUY / ADD")
+        elif ideas["mood"] == "sell":
+            st.error("Action: SELL / HEDGE")
+        else:
+            st.info("Action: WAIT / NEUTRAL")
 
-    st.metric("Bullish Probability", f"{prob_bull*100:.1f}%")
-    st.metric("RSI(14)", f"{rsi_val:.1f}")
-    st.metric("MACD Hist", f"{macd_hist:.5f}")
-    if summary["trend"] == "bullish":
-        st.success(f"News: BULLISH ({summary['score']:+d})")
-    elif summary["trend"] == "bearish":
-        st.error(f"News: BEARISH ({summary['score']:+d})")
-    else:
-        st.warning(f"News: NEUTRAL ({summary['score']:+d})")
-
-    ideas = ai_suggestions(prob_bull, rsi_val, macd_hist, dfo, summary["score"], acc)
-    if ideas["mood"] == "buy":
-        st.success("Action: BUY / ADD")
-    elif ideas["mood"] == "sell":
-        st.error("Action: SELL / HEDGE")
-    else:
-        st.info("Action: WAIT / NEUTRAL")
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Entry", f"{ideas['entry']:.4f} {vs_currency.upper()}")
-    colB.metric("Target", f"{ideas['target']:.4f} {vs_currency.upper()}")
-    colC.metric("Stop", f"{ideas['stop']:.4f} {vs_currency.upper()}")
-    colD.metric("Pos Size", f"{ideas['pos_size_pct']*100:.1f}%")
+        st.metric("Entry", f"{ideas['entry']:.4f} {vs_currency.upper()}")
+        st.metric("Target", f"{ideas['target']:.4f} {vs_currency.upper()}")
+        st.metric("Stop", f"{ideas['stop']:.4f} {vs_currency.upper()}")
+        st.metric("Pos Size", f"{ideas['pos_size_pct']*100:.1f}%")
+        st.caption(ideas["explain"])
 
     # Log current signal
     log_signal(coin_label, ideas["mood"], prob_bull, rsi_val, macd_hist, summary["score"], acc)
 
-    # Flip detection + alerts
-    key = f"last_signal_{coin_id}"
-    current_signal = ideas["mood"]
-    if key not in st.session_state:
-        st.session_state[key] = current_signal
-    flipped = (current_signal != st.session_state[key])
-    st.caption(f"Signal: **{current_signal.upper()}** {'(flipped)' if flipped else ''}")
-    if flipped and (discord_webhook or tg_token or (smtp_host and smtp_from and smtp_to)):
-        results = try_alerts(current_signal, ideas, coin_label, ideas['last'], {
-            "discord_webhook": discord_webhook, "tg_token": tg_token, "tg_chat": tg_chat,
-            "smtp_host": smtp_host, "smtp_port": smtp_port, "smtp_user": smtp_user, "smtp_pass": smtp_pass,
-            "smtp_from": smtp_from, "smtp_to": smtp_to
-        })
-        log_alert(coin_label, current_signal, ideas['last'], ideas, results)
-        st.toast(f"Alert sent for {coin_label}: {current_signal}", icon="🔔")
-        st.write("Alert results:", results)
-        st.session_state[key] = current_signal
-
-def render_logs():
-    st.subheader("📜 Logs")
-    # CSV signals summary
-    sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
-    if os.path.exists(sig_csv):
-        df = pd.read_csv(sig_csv)
-        st.dataframe(df.tail(200), use_container_width=True)
-    else:
-        st.info("No signal logs yet.")
-    if os.path.exists(DB_PATH):
-        with sqlite3.connect(DB_PATH) as conn:
-            dfA = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200", conn)
-            st.write("Alerts (latest 200)")
-            st.dataframe(dfA, use_container_width=True)
-    else:
-        st.info("No alert DB yet.")
-
-if st.button("Show Logs"):
-    render_logs()
-
 def run_watchlist():
+    # Start overall timers & status
+    start_total = time.time()
+    sb_status.info("Starting run…")
     coins = [c.strip() for c in coins_text.split(",") if c.strip()]
     if not coins:
         st.warning("Please enter at least one CoinGecko ID (e.g., bitcoin).")
         return
+
     if layout_choice == "Tabs":
         tabs = st.tabs([c for c in coins])
-        for tab, coin in zip(tabs, coins):
+        for i, (tab, coin) in enumerate(zip(tabs, coins), start=1):
             with tab:
-                render_coin_block(coin)
+                render_coin_block(coin, start_total, i, len(coins))
     else:
-        for coin in coins:
+        for i, coin in enumerate(coins, start=1):
             with st.container():
-                render_coin_block(coin)
+                render_coin_block(coin, start_total, i, len(coins))
                 st.divider()
+
+    elapsed_total = time.time() - start_total
+    st.success(f"✅ Report finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • Total time {elapsed_total:.1f}s")
+    sb_status.success(f"Done • {elapsed_total:.1f}s total")
 
 if run_btn:
     run_watchlist()
