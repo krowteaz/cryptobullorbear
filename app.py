@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests, time, math, re, smtplib, sqlite3, os
+import requests, time, math, re, smtplib, sqlite3, os, tempfile
 from email.message import EmailMessage
 from datetime import datetime
 from typing import Tuple, List, Dict
@@ -13,9 +13,36 @@ from xgboost import XGBClassifier
 import plotly.graph_objects as go
 import feedparser
 
-LOG_DIR = "/mnt/data/logs"
+# ===================== Streamlit-Safe Log Dir =====================
+def _resolve_log_dir() -> str:
+    # 1) ENV override
+    env_path = os.getenv("LOG_DIR")
+    if env_path:
+        try:
+            os.makedirs(env_path, exist_ok=True)
+            if os.access(env_path, os.W_OK):
+                return env_path
+        except Exception:
+            pass
+    # 2) Home directory default
+    home = os.path.join(os.path.expanduser("~"), "crypto_logs")
+    try:
+        os.makedirs(home, exist_ok=True)
+        if os.access(home, os.W_OK):
+            return home
+    except Exception:
+        pass
+    # 3) Temp fallback
+    tmp = tempfile.gettempdir()
+    return tmp
+
+LOG_DIR = _resolve_log_dir()
 CSV_PATH = os.path.join(LOG_DIR, "signals.csv")
 DB_PATH = os.path.join(LOG_DIR, "signals.db")
+
+def _log_dir_status():
+    ok = os.access(LOG_DIR, os.W_OK)
+    return ("🟢 Logs OK", ok) if ok else ("🔴 No Write Access", ok)
 
 # ===================== CoinGecko Helpers =====================
 def cg_get(path, params=None, api_key=None, base_url="https://api.coingecko.com/api/v3", max_retries=5):
@@ -384,8 +411,8 @@ def log_signal(coin, mood, prob, rsi, macd, news, model_acc):
         pd.DataFrame([row]).to_csv(sig_csv, mode="a", header=False, index=False)
 
 # ===================== Unified Settings (Sidebar) =====================
-st.set_page_config(page_title="Crypto Bull or Bear • v9", page_icon="📈", layout="wide")
-st.title("📈 Crypto Bull or Bear — Unified Dashboard (v9)")
+st.set_page_config(page_title="Crypto Bull or Bear • v9.1", page_icon="📈", layout="wide")
+st.title("📈 Crypto Bull or Bear — Streamlit-Safe (v9.1)")
 st.caption("Educational demo. Uses CoinGecko + XGBoost + coin-specific news. Not financial advice.")
 
 with st.sidebar:
@@ -395,30 +422,24 @@ with st.sidebar:
         base_url = st.selectbox("CG API Base", ["https://api.coingecko.com/api/v3", "https://pro-api.coingecko.com/api/v3"], index=0)
         vs_currency = st.selectbox("Quote Currency", ["usd","eur","php","jpy"], index=0)
         days_choice = st.selectbox("Lookback", ["7","14","30","90","180","365"], index=2)
-        theme = st.selectbox("Theme", ["Auto","Light","Dark"], index=0)
 
         st.markdown("---")
         st.markdown("### Watchlist & Display")
-        # Improved coin search
         q = st.text_input("Search coins (name or ticker)", value=st.session_state.get("last_query","bitcoin"))
         if st.button("Search"):
             st.session_state["last_query"] = q
             try:
                 res = cg_search_coins(q, api_key=api_key, base_url=base_url)
-                # store as list of dicts: {id, label}
                 st.session_state["search_pool"] = [{"id": c.get("id"), "label": f"{c.get('name')} ({c.get('symbol').upper()})"} for c in res[:30]]
             except Exception as e:
                 st.error(f"Search error: {e}")
         pool = st.session_state.get("search_pool", [{"id":"bitcoin","label":"Bitcoin (BTC)"},{"id":"ethereum","label":"Ethereum (ETH)"},{"id":"solana","label":"Solana (SOL)"}])
         labels = [p["label"] for p in pool]
         selection = st.multiselect("Add to Watchlist", options=labels, default=st.session_state.get("watch_defaults", labels[:3]))
-        # map back to ids
         id_map = {p["label"]: p["id"] for p in pool}
         watch_ids = [id_map[l] for l in selection if l in id_map]
         st.session_state["watch_defaults"] = selection
-
         layout_choice = st.radio("Layout", ["Stacked (default)","Tabs"], index=0)
-        auto_expand = st.checkbox("Auto-expand latest coin block", value=True)
 
         st.markdown("---")
         st.markdown("### Alerts & Notifications")
@@ -444,6 +465,10 @@ with st.sidebar:
         refresh = st.checkbox("Auto-refresh (60s)", value=False)
         run_btn = st.button("RUN / REFRESH", type="primary")
 
+        st.markdown("---")
+        title, ok = _log_dir_status()
+        st.caption(f"{title}: logs saved in `{LOG_DIR}`")
+
 # Connectivity
 try:
     _ = cg_ping(api_key=api_key, base_url=base_url)
@@ -451,7 +476,7 @@ try:
 except Exception as e:
     st.error(f"Cannot reach CoinGecko API: {e}")
 
-def render_coin_block(coin_id: str, last=False):
+def render_coin_block(coin_id: str):
     st.markdown(f"#### {coin_id}")
     placeholder = st.empty()
     with placeholder.container():
@@ -474,7 +499,6 @@ def render_coin_block(coin_id: str, last=False):
             ma20, bb_up, bb_dn = bollinger(dfo["close"], window=20, num_std=2)
             dfo["bb_mid"] = ma20; dfo["bb_up"] = bb_up; dfo["bb_dn"] = bb_dn
 
-            st.subheader(coin_label)
             fig = go.Figure(data=[go.Candlestick(
                 x=dfo["time"], open=dfo["open"], high=dfo["high"], low=dfo["low"], close=dfo["close"],
                 increasing_line_color="green", decreasing_line_color="red",
@@ -492,6 +516,8 @@ def render_coin_block(coin_id: str, last=False):
             cross_dn = (dfo["ema_5"] < dfo["ema_20"]) & (dfo["ema_5"].shift(1) >= dfo["ema_20"].shift(1))
             fig.add_trace(go.Scatter(x=dfo["time"][cross_up], y=dfo["close"][cross_up], mode="markers", name="Bullish X", marker_symbol="triangle-up", marker_size=10))
             fig.add_trace(go.Scatter(x=dfo["time"][cross_dn], y=dfo["close"][cross_dn], mode="markers", name="Bearish X", marker_symbol="triangle-down", marker_size=10))
+
+            st.subheader(coin_label)
             st.plotly_chart(fig, use_container_width=True)
 
             # Signals
@@ -536,6 +562,7 @@ def render_coin_block(coin_id: str, last=False):
             colB.metric("Target", f"{ideas['target']:.4f} {vs_currency.upper()}")
             colC.metric("Stop", f"{ideas['stop']:.4f} {vs_currency.upper()}")
             colD.metric("Pos Size", f"{ideas['pos_size_pct']*100:.1f}%")
+
             with st.expander("Top Headlines"):
                 for it in (summary.get("top_pos", []) + summary.get("top_neg", []))[:6]:
                     st.write(f"• [{it['title']}]({it['link']})")
@@ -550,60 +577,90 @@ def render_coin_block(coin_id: str, last=False):
                 st.session_state[key] = current_signal
             flipped = (current_signal != st.session_state[key])
             st.caption(f"Signal: **{current_signal.upper()}** {'(flipped)' if flipped else ''}")
-            if flipped and ("alert_opts" in st.session_state and any(st.session_state['alert_opts'].values())):
-                results = try_alerts(current_signal, ideas, coin_label, ideas['last'], st.session_state['alert_opts'])
-                log_alert(coin_label, current_signal, ideas['last'], ideas, results)
-                st.toast(f"Alert sent for {coin_label}: {current_signal}", icon="🔔")
-                st.write("Alert results:", results)
+            if flipped:
+                alert_opts = {
+                    "discord_webhook": st.session_state.get("discord_webhook", ""),
+                    "tg_token": st.session_state.get("tg_token", ""),
+                    "tg_chat": st.session_state.get("tg_chat", ""),
+                    "smtp_host": st.session_state.get("smtp_host", ""),
+                    "smtp_port": st.session_state.get("smtp_port", 587),
+                    "smtp_user": st.session_state.get("smtp_user", ""),
+                    "smtp_pass": st.session_state.get("smtp_pass", ""),
+                    "smtp_from": st.session_state.get("smtp_from", ""),
+                    "smtp_to": st.session_state.get("smtp_to", ""),
+                }
+                # pull latest values from Settings (so they persist)
+                st.session_state.update({
+                    "discord_webhook": st.session_state.get("discord_webhook", ""),
+                    "tg_token": st.session_state.get("tg_token", ""),
+                    "tg_chat": st.session_state.get("tg_chat", ""),
+                    "smtp_host": st.session_state.get("smtp_host", ""),
+                    "smtp_port": st.session_state.get("smtp_port", 587),
+                    "smtp_user": st.session_state.get("smtp_user", ""),
+                    "smtp_pass": st.session_state.get("smtp_pass", ""),
+                    "smtp_from": st.session_state.get("smtp_from", ""),
+                    "smtp_to": st.session_state.get("smtp_to", ""),
+                })
+                # Try alerts if any channel is configured
+                if any(alert_opts.values()):
+                    results = try_alerts(current_signal, ideas, coin_label, ideas['last'], alert_opts)
+                    log_alert(coin_label, current_signal, ideas['last'], ideas, results)
+                    st.toast(f"Alert sent for {coin_label}: {current_signal}", icon="🔔")
+                    st.write("Alert results:", results)
                 st.session_state[key] = current_signal
 
-    if auto_expand and last:
-        st.expander("Latest result (auto-expanded)", expanded=True)
-
-def render_logs():
-    st.subheader("📜 Logs")
-    sig_csv = os.path.join(LOG_DIR, "signals_stream.csv")
-    if os.path.exists(sig_csv):
-        df = pd.read_csv(sig_csv)
-        st.dataframe(df.tail(200), use_container_width=True)
-    else:
-        st.info("No signal logs yet.")
-    if os.path.exists(DB_PATH):
-        with sqlite3.connect(DB_PATH) as conn:
-            dfA = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200", conn)
-            st.write("Alerts (latest 200)")
-            st.dataframe(dfA, use_container_width=True)
-    else:
-        st.info("No alert DB yet.")
-
-if st.button("Show Logs"):
-    render_logs()
-
-def run_watchlist():
-    # Prepare alert options into session for reuse
-    st.session_state['alert_opts'] = {
-        "discord_webhook": discord_webhook, "tg_token": tg_token, "tg_chat": tg_chat,
-        "smtp_host": smtp_host, "smtp_port": smtp_port, "smtp_user": smtp_user, "smtp_pass": smtp_pass,
-        "smtp_from": smtp_from, "smtp_to": smtp_to
-    }
+def run_watchlist(watch_ids, layout_choice):
     coins = watch_ids or ["bitcoin"]
     if layout_choice.startswith("Tabs"):
         tabs = st.tabs(coins)
-        for i, (tab, coin) in enumerate(zip(tabs, coins)):
+        for tab, coin in zip(tabs, coins):
             with tab:
-                render_coin_block(coin, last=(i==len(coins)-1))
+                render_coin_block(coin)
     else:
-        for i, coin in enumerate(coins):
+        for coin in coins:
             with st.container():
-                render_coin_block(coin, last=(i==len(coins)-1))
+                render_coin_block(coin)
                 st.divider()
 
-if run_btn:
-    run_watchlist()
+# ===================== Sidebar Controls & RUN =====================
+with st.sidebar:
+    with st.expander("⚙️ Settings", expanded=True):
+        # Keep watch_ids/layout in outer scope for run below
+        try:
+            pool = st.session_state.get("search_pool", [{"id":"bitcoin","label":"Bitcoin (BTC)"},{"id":"ethereum","label":"Ethereum (ETH)"},{"id":"solana","label":"Solana (SOL)"}])
+            labels = [p["label"] for p in pool]
+            id_map = {p["label"]: p["id"] for p in pool}
+            selection = st.session_state.get("watch_defaults", labels[:3])
+            watch_ids = [id_map[l] for l in selection if l in id_map]
+        except Exception:
+            watch_ids = ["bitcoin"]
+        layout_choice = st.session_state.get("layout_choice", "Stacked (default)")
 
+        if st.button("RUN / REFRESH", type="primary", use_container_width=True):
+            # persist alert options for alerting in render
+            st.session_state["discord_webhook"] = st.session_state.get("discord_webhook","")
+            st.session_state["tg_token"] = st.session_state.get("tg_token","")
+            st.session_state["tg_chat"] = st.session_state.get("tg_chat","")
+            st.session_state["smtp_host"] = st.session_state.get("smtp_host","")
+            st.session_state["smtp_port"] = st.session_state.get("smtp_port",587)
+            st.session_state["smtp_user"] = st.session_state.get("smtp_user","")
+            st.session_state["smtp_pass"] = st.session_state.get("smtp_pass","")
+            st.session_state["smtp_from"] = st.session_state.get("smtp_from","")
+            st.session_state["smtp_to"] = st.session_state.get("smtp_to","")
+            st.session_state["layout_choice"] = layout_choice
+            st.session_state["watch_ids"] = watch_ids
+            st.session_state["trigger_run"] = True
+        else:
+            st.session_state["trigger_run"] = st.session_state.get("trigger_run", False)
+
+# Trigger run
+if st.session_state.get("trigger_run", False):
+    run_watchlist(st.session_state.get("watch_ids", ["bitcoin"]), st.session_state.get("layout_choice", "Stacked (default)"))
+
+# Optional auto-refresh
 if 'last_auto' not in st.session_state:
     st.session_state['last_auto'] = 0.0
-if refresh:
+if st.session_state.get("trigger_run") and st.session_state.get("refresh", False):
     import time as _t
     now = _t.time()
     if now - st.session_state['last_auto'] > 60:
