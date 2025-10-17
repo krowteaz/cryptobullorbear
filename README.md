@@ -1,13 +1,11 @@
-# Crypto Bull or Bear — v9.3 (Mobile + Quick Compare)
+# Crypto Bull or Bear — v9.4 (Speed Mode + Collapsible UI)
 
-- 📱 **Mobile-friendly** single-coin dashboard
-- 🔁 **Quick Compare**: shows previous vs latest run side-by-side
-- 💾 Remembers last coin and last signal in the sidebar
-- 📰 Coin-specific RSS sentiment
-- 🕯️ Candlesticks with EMA/Bollinger
-- 🤖 XGBoost probability + AI action (entry/target/stop, position size)
-- 🔔 Discord / Telegram / Email alerts on signal flips
-- ✅ Streamlit-safe logs (CSV + SQLite), with writable path fallback
+## New in 9.4
+- 🔽 **Collapsible** sidebar sections: Settings / Search / Alerts / Logs
+- ⚡ **Speed Mode**: skip retraining if a cached model exists for the coin+lookback
+- 🧠 **Caching**: CoinGecko data & coin profile cached; model bundles cached per key
+- ⏱️ **Progress steps**: Fetch → Indicators → Modeling → Predict → Render
+- ✅ Still single-coin, mobile-friendly, and Streamlit-cloud safe
 
 ## Run
 ```bash

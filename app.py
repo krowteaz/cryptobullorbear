@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 from xgboost import XGBClassifier
 import feedparser
 
-# ============== Safe log dir (v9.1+) ==============
+# ============== Safe log dir ==============
 def _resolve_log_dir() -> str:
     env_path = os.getenv("LOG_DIR")
     if env_path:
@@ -35,7 +35,7 @@ LOG_DIR = _resolve_log_dir()
 CSV_PATH = os.path.join(LOG_DIR, "signals.csv")
 DB_PATH = os.path.join(LOG_DIR, "signals.db")
 
-# ============== CoinGecko helpers (no enterprise-only params) ==============
+# ============== CoinGecko helpers ==============
 def cg_get(path, params=None, api_key=None, base_url="https://api.coingecko.com/api/v3", max_retries=5):
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     headers = {}
@@ -53,16 +53,16 @@ def cg_get(path, params=None, api_key=None, base_url="https://api.coingecko.com/
         return r.json()
     r.raise_for_status()
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def cg_ping(api_key=None, base_url="https://api.coingecko.com/api/v3"):
     return cg_get("/ping", api_key=api_key, base_url=base_url)
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def cg_search_coins(query, api_key=None, base_url="https://api.coingecko.com/api/v3"):
     data = cg_get("/search", params={"query": query}, api_key=api_key, base_url=base_url)
     return data.get("coins", [])
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_market_chart(coin_id: str, vs_currency: str, days: str, api_key=None, base_url="https://api.coingecko.com/api/v3"):
     data = cg_get(f"/coins/{coin_id}/market_chart", params={"vs_currency": vs_currency, "days": days}, api_key=api_key, base_url=base_url)
     dfp = pd.DataFrame(data.get("prices", []), columns=["ts","price"])
@@ -73,7 +73,7 @@ def fetch_market_chart(coin_id: str, vs_currency: str, days: str, api_key=None, 
     df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("Asia/Manila")
     return df.sort_values("time")[["time","price","volume"]].reset_index(drop=True)
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_ohlc(coin_id: str, vs_currency: str, days: str, api_key=None, base_url="https://api.coingecko.com/api/v3"):
     data = cg_get(f"/coins/{coin_id}/ohlc", params={"vs_currency": vs_currency, "days": days}, api_key=api_key, base_url=base_url)
     if not data: return pd.DataFrame()
@@ -81,12 +81,12 @@ def fetch_ohlc(coin_id: str, vs_currency: str, days: str, api_key=None, base_url
     df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("Asia/Manila")
     return df.sort_values("time")[["time","open","high","low","close"]].reset_index(drop=True)
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_coin_symbol(coin_id: str, api_key=None, base_url="https://api.coingecko.com/api/v3"):
     data = cg_get(f"/coins/{coin_id}", params={"localization":"false","tickers":"false","market_data":"false","community_data":"false","developer_data":"false","sparkline":"false"}, api_key=api_key, base_url=base_url)
     return (data.get("symbol","").upper() or coin_id[:4].upper(), data.get("name", coin_id))
 
-# ============== Indicators ==============
+# ============== Indicators & features ==============
 def ema(series: pd.Series, span:int): return series.ewm(span=span, adjust=False).mean()
 def rsi(series: pd.Series, period:int=14):
     d=series.diff()
@@ -120,19 +120,23 @@ def build_features(df):
           "rsi_14","macd","macd_signal","macd_hist","ema_5","ema_10","ema_20","ema_50","sma_5","sma_10","sma_20","sma_50"]
     return df, cols
 
-# ============== Modeling ==============
+# ============== Model training & caching ==============
 @st.cache_resource(show_spinner=False)
-def train_xgb(Xtr, ytr, Xva, yva):
+def get_model_bundle(key: str, Xtr, ytr, Xva, yva):
     model=XGBClassifier(n_estimators=400,max_depth=4,learning_rate=0.05,subsample=0.9,colsample_bytree=0.9,
                         reg_lambda=1.0,objective="binary:logistic",eval_metric="logloss",tree_method="hist")
-    model.fit(Xtr,ytr,eval_set=[(Xva,yva)],verbose=False); return model
+    scaler=StandardScaler()
+    Xtr_s=scaler.fit_transform(Xtr)
+    Xva_s=scaler.transform(Xva)
+    model.fit(Xtr_s,ytr,eval_set=[(Xva_s,yva)],verbose=False)
+    return {"model":model, "scaler":scaler}
 
 def ts_split(df, cols, ratio=0.8):
     X=df[cols].values; y=df["target"].values; i=int(len(df)*ratio)
     return X[:i], y[:i], X[i:], y[i:], i
 
-def eval_model(model, Xt, yt):
-    p=model.predict_proba(Xt)[:,1]; y=(p>=0.5).astype(int)
+def eval_model(model, Xt_s, yt):
+    p=model.predict_proba(Xt_s)[:,1]; y=(p>=0.5).astype(int)
     return accuracy_score(yt,y), confusion_matrix(yt,y), classification_report(yt,y,zero_division=0), p, y
 
 # ============== News sentiment (coin-specific RSS) ==============
@@ -146,7 +150,7 @@ def _mentions(text,name,ticker):
     t=text.lower()
     return (name.lower() in t) or (re.search(rf"\\b{re.escape(ticker.lower())}\\b", t) is not None)
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def coin_news(name,ticker,max_items=50):
     out=[]
     for url in NEWS_RSS:
@@ -260,55 +264,53 @@ def log_alerts(coin, signal, ideas, results):
     row={"ts":ts,"coin":coin,"signal":signal,"price":ideas['last'],"entry":ideas['entry'],"target":ideas['target'],"stop":ideas['stop'],"size":ideas['size'],"channels":"|".join(results.keys()),"codes":"|".join(map(str,results.values()))}
     pd.DataFrame([row]).to_csv(CSV_PATH, mode="a", header=not os.path.exists(CSV_PATH), index=False)
 
-# ============== UI (mobile-friendly) ==============
-st.set_page_config(page_title="Crypto Bull or Bear • v9.3", page_icon="📈", layout="wide")
-st.title("📈 Crypto Bull or Bear — Single‑Coin (v9.3)")
+# ============== UI (collapsible, speed mode) ==============
+st.set_page_config(page_title="Crypto Bull or Bear • v9.4", page_icon="📈", layout="wide")
+st.title("📈 Crypto Bull or Bear — v9.4")
 st.caption("Educational demo. CoinGecko + XGBoost + RSI/MACD + coin‑specific news. Not financial advice.")
 
 with st.sidebar:
     st.subheader("Last session")
     st.info(f"Coin: {st.session_state.get('last_coin','—')}  |  Signal: {st.session_state.get('last_signal','—').upper() if st.session_state.get('last_signal') else '—'}")
 
-    st.divider()
-    st.subheader("Settings")
-    api_key = st.text_input("CoinGecko API Key (optional)", type="password")
-    base_url = st.selectbox("CG API", ["https://api.coingecko.com/api/v3","https://pro-api.coingecko.com/api/v3"], index=0)
-    vs_currency = st.selectbox("Quote", ["usd","eur","php","jpy"], index=0)
-    days = st.selectbox("Lookback", ["7","14","30","90","180","365"], index=2)
-    auto_refresh = st.checkbox("Auto‑refresh every 60s", value=False)
+    with st.expander("⚙️ Settings", expanded=False):
+        api_key = st.text_input("CoinGecko API Key (optional)", type="password")
+        base_url = st.selectbox("CG API", ["https://api.coingecko.com/api/v3","https://pro-api.coingecko.com/api/v3"], index=0)
+        vs_currency = st.selectbox("Quote", ["usd","eur","php","jpy"], index=0)
+        days = st.selectbox("Lookback", ["7","14","30","90","180","365"], index=2)
+        speed_mode = st.toggle("⚡ Speed Mode (skip retrain if model cached)", value=True)
+        auto_refresh = st.checkbox("Auto‑refresh every 60s", value=False)
 
-    st.divider()
-    st.subheader("Search & Run")
-    query = st.text_input("Search coin (name or ticker)", value=st.session_state.get("last_query","bitcoin"))
-    if st.button("Search"):
-        try:
-            res = cg_search_coins(query, api_key=api_key, base_url=base_url)
-            st.session_state["search_hits"]=[(c.get("id"), f"{c.get('name')} ({c.get('symbol').upper()})") for c in res[:15]]
-            st.success(f"Found {len(st.session_state['search_hits'])} result(s).")
-        except Exception as e:
-            st.error(f"Search error: {e}")
-    hits = st.session_state.get("search_hits",[("bitcoin","Bitcoin (BTC)")])
-    coin_id = st.selectbox("Pick coin", [h[0] for h in hits], format_func=lambda x: dict(hits).get(x,x))
-    st.session_state["last_query"] = query
+    with st.expander("🔍 Search", expanded=True):
+        query = st.text_input("Search coin (name or ticker)", value=st.session_state.get("last_query","bitcoin"))
+        if st.button("Search"):
+            try:
+                res = cg_search_coins(query, api_key=api_key, base_url=base_url)
+                st.session_state["search_hits"]=[(c.get("id"), f"{c.get('name')} ({c.get('symbol').upper()})") for c in res[:15]]
+                st.success(f"Found {len(st.session_state['search_hits'])} result(s).")
+            except Exception as e:
+                st.error(f"Search error: {e}")
+        hits = st.session_state.get("search_hits",[("bitcoin","Bitcoin (BTC)")])
+        coin_id = st.selectbox("Pick coin", [h[0] for h in hits], format_func=lambda x: dict(hits).get(x,x))
+        st.session_state["last_query"] = query
 
-    st.divider()
-    st.subheader("Alerts")
-    discord = st.text_input("Discord Webhook URL")
-    tg_token = st.text_input("Telegram Bot Token")
-    tg_chat = st.text_input("Telegram Chat ID")
-    smtp_host = st.text_input("SMTP Host")
-    smtp_port = st.number_input("SMTP Port", value=587, step=1)
-    smtp_user = st.text_input("SMTP User")
-    smtp_pass = st.text_input("SMTP Pass", type="password")
-    smtp_from = st.text_input("From Email")
-    smtp_to = st.text_input("To Email")
-    if st.button("Send Test Alert"):
-        res=send_alerts("TEST", {"last":0,"entry":0,"target":0,"stop":0,"size":0,"note":"config test"}, "TEST", 
-                        {"discord":discord,"tg_token":tg_token,"tg_chat":tg_chat,"smtp_host":smtp_host,"smtp_port":smtp_port,"smtp_user":smtp_user,"smtp_pass":smtp_pass,"smtp_from":smtp_from,"smtp_to":smtp_to})
-        st.write("Test results:", res)
+    with st.expander("🔔 Alerts", expanded=False):
+        discord = st.text_input("Discord Webhook URL")
+        tg_token = st.text_input("Telegram Bot Token")
+        tg_chat = st.text_input("Telegram Chat ID")
+        smtp_host = st.text_input("SMTP Host")
+        smtp_port = st.number_input("SMTP Port", value=587, step=1)
+        smtp_user = st.text_input("SMTP User")
+        smtp_pass = st.text_input("SMTP Pass", type="password")
+        smtp_from = st.text_input("From Email")
+        smtp_to = st.text_input("To Email")
+        if st.button("Send Test Alert"):
+            res=send_alerts("TEST", {"last":0,"entry":0,"target":0,"stop":0,"size":0,"note":"config test"}, "TEST", 
+                            {"discord":discord,"tg_token":tg_token,"tg_chat":tg_chat,"smtp_host":smtp_host,"smtp_port":smtp_port,"smtp_user":smtp_user,"smtp_pass":smtp_pass,"smtp_from":smtp_from,"smtp_to":smtp_to})
+            st.write("Test results:", res)
 
-    st.divider()
-    st.caption(f"Logs path: {LOG_DIR}")
+    with st.expander("ℹ️ Logs & Status", expanded=False):
+        st.caption(f"Logs path: {LOG_DIR}")
 
 run = st.button("Run / Refresh", type="primary", use_container_width=True)
 
@@ -319,22 +321,62 @@ try:
 except Exception as e:
     st.error(f"CoinGecko unreachable: {e}")
 
+def progress_step(pbar, txt, pct):
+    pbar.progress(pct, text=txt)
+
 def run_once(coin_id):
-    df=fetch_market_chart(coin_id, vs_currency, days, api_key=api_key, base_url=base_url)
-    ohlc=fetch_ohlc(coin_id, vs_currency, days, api_key=api_key, base_url=base_url)
-    if df.empty or ohlc.empty or len(df)<120:
-        st.warning("Not enough data; try a longer lookback.")
-        return None
+    st.session_state["last_coin_id"]=coin_id
     sym,name=fetch_coin_symbol(coin_id, api_key=api_key, base_url=base_url)
     label=f"{name} ({sym})"
 
-    # Chart
+    pbar = st.progress(0, text="Starting…")
+    progress_step(pbar, "1️⃣ Fetching data…", 10)
+    df=fetch_market_chart(coin_id, vs_currency, days, api_key=api_key, base_url=base_url)
+    ohlc=fetch_ohlc(coin_id, vs_currency, days, api_key=api_key, base_url=base_url)
+    if df.empty or ohlc.empty or len(df)<120:
+        pbar.empty()
+        st.warning("Not enough data; try a longer lookback.")
+        return None
+
+    progress_step(pbar, "2️⃣ Computing indicators…", 35)
     ohlc=ohlc.copy()
     ohlc["ema5"]=ohlc["close"].ewm(span=5,adjust=False).mean()
     ohlc["ema20"]=ohlc["close"].ewm(span=20,adjust=False).mean()
     bb_mid, bb_up, bb_dn = bollinger(ohlc["close"],20,2)
     ohlc["bb_mid"]=bb_mid; ohlc["bb_up"]=bb_up; ohlc["bb_dn"]=bb_dn
 
+    feats, cols = build_features(df)
+
+    progress_step(pbar, "3️⃣ Modeling…", 60)
+    key=f"{coin_id}_{vs_currency}_{days}"
+    Xtr,ytr,Xt,yt,idx = ts_split(feats, cols, 0.8)
+
+    # Cache model bundle per key; if Speed Mode and cache exists, skip retrain
+    bundle=None
+    if speed_mode and key in st.session_state.get("model_cache", {}):
+        bundle = st.session_state["model_cache"][key]
+    else:
+        bundle=get_model_bundle(key, Xtr, ytr, Xt, yt)
+        cache=st.session_state.get("model_cache", {})
+        cache[key]=bundle
+        st.session_state["model_cache"]=cache
+
+    scaler=bundle["scaler"]; model=bundle["model"]
+    Xt_s=scaler.transform(Xt)
+    acc, cm, report, yprob, ypred = eval_model(model, Xt_s, yt)
+
+    progress_step(pbar, "4️⃣ Predicting latest bar…", 80)
+    last = feats.iloc[[-1]][cols].values
+    last_p = float(model.predict_proba(scaler.transform(last))[0,1])
+    rsi_val = float(feats.iloc[-1]["rsi_14"])
+    macd_hist = float(feats.iloc[-1]["macd_hist"])
+
+    items = coin_news(name, sym, 60)
+    ns = news_summary(items)
+
+    progress_step(pbar, "5️⃣ Rendering…", 95)
+
+    # Chart
     fig = go.Figure(data=[go.Candlestick(x=ohlc["time"],open=ohlc["open"],high=ohlc["high"],low=ohlc["low"],close=ohlc["close"],
                                          increasing_line_color="green",decreasing_line_color="red",
                                          increasing_fillcolor="green",decreasing_fillcolor="red",name="OHLC")])
@@ -345,24 +387,6 @@ def run_once(coin_id):
     fig.add_trace(go.Scatter(x=ohlc["time"], y=ohlc["bb_mid"], mode="lines", name="BB Mid", line=dict(dash="dot")))
     fig.add_trace(go.Scatter(x=ohlc["time"], y=ohlc["bb_dn"], mode="lines", name="BB Lower", line=dict(dash="dot")))
 
-    # Features + model
-    feats, cols = build_features(df)
-    Xtr,ytr,Xt,yt,idx = ts_split(feats, cols, 0.8)
-    sc=StandardScaler(); Xtr=sc.fit_transform(Xtr); Xt=sc.transform(Xt)
-    model=train_xgb(Xtr,ytr,Xt,yt)
-    acc, cm, report, yprob, ypred = eval_model(model, Xt, yt)
-
-    last = feats.iloc[[-1]][cols].values
-    last_p = float(model.predict_proba(sc.transform(last))[0,1])
-    rsi_val = float(feats.iloc[-1]["rsi_14"])
-    macd_hist = float(feats.iloc[-1]["macd_hist"])
-
-    items = coin_news(name, sym, 60)
-    ns = news_summary(items)
-
-    idea = suggest(last_p, rsi_val, macd_hist, ohlc, ns["score"], acc)
-
-    # ---- Layout (mobile-friendly): stack first, then allow 2 columns on wide screens
     st.subheader(label)
     st.plotly_chart(fig, use_container_width=True)
     c1, c2, c3, c4 = st.columns(4)
@@ -371,6 +395,7 @@ def run_once(coin_id):
     c3.metric("MACD Hist", f"{macd_hist:.5f}")
     c4.metric("News", f"{ns['trend'].upper()} ({ns['score']:+d})")
 
+    idea = suggest(last_p, rsi_val, macd_hist, ohlc, ns["score"], acc)
     if idea["mood"]=="buy": st.success("Action: BUY / ADD")
     elif idea["mood"]=="sell": st.error("Action: SELL / HEDGE")
     else: st.info("Action: WAIT / NEUTRAL")
@@ -384,25 +409,28 @@ def run_once(coin_id):
         for it in ns["top"]:
             st.write(f"• [{it['title']}]({it['link']})")
 
-    # Save last signal to sidebar + store compare history (max 2)
+    # Save last signal
     st.session_state["last_coin"]=label
     st.session_state["last_signal"]=idea["mood"]
-    snapshot={"time": datetime.utcnow().isoformat(), "coin": label, "mood": idea["mood"], "prob": last_p, "rsi": rsi_val, "macd": macd_hist, "news": ns["score"],
-              "entry": idea["entry"], "target": idea["target"], "stop": idea["stop"], "size": idea["size"]}
-    hist=st.session_state.get("compare_hist", [])
-    hist.append(snapshot)
-    st.session_state["compare_hist"]=hist[-2:]  # keep last two
 
     # Alerts on flip
-    key="last_signal_runtime"
-    prev=st.session_state.get(key)
+    key_sig="last_signal_runtime"
+    prev=st.session_state.get(key_sig)
     flipped = prev is not None and prev != idea["mood"]
     st.caption(f"Signal: **{idea['mood'].upper()}** {'(flipped)' if flipped else ''}")
-    st.session_state[key]=idea["mood"]
+    st.session_state[key_sig]=idea["mood"]
 
     # fire alerts if configured
-    opts={"discord":discord,"tg_token":tg_token,"tg_chat":tg_chat,"smtp_host":smtp_host,"smtp_port":smtp_port,"smtp_user":smtp_user,"smtp_pass":smtp_pass,"smtp_from":smtp_from,"smtp_to":smtp_to}
-    if flipped and any([discord,tg_token and tg_chat, smtp_host and smtp_from and smtp_to]):
+    opts={"discord":st.session_state.get("discord",""),
+          "tg_token":st.session_state.get("tg_token",""),
+          "tg_chat":st.session_state.get("tg_chat",""),
+          "smtp_host":st.session_state.get("smtp_host",""),
+          "smtp_port":st.session_state.get("smtp_port",587),
+          "smtp_user":st.session_state.get("smtp_user",""),
+          "smtp_pass":st.session_state.get("smtp_pass",""),
+          "smtp_from":st.session_state.get("smtp_from",""),
+          "smtp_to":st.session_state.get("smtp_to","")}
+    if flipped and any([opts["discord"], opts["tg_token"] and opts["tg_chat"], opts["smtp_host"] and opts["smtp_from"] and opts["smtp_to"]]):
         res=send_alerts(idea["mood"], idea, label, opts)
         log_alerts(label, idea["mood"], idea, res)
         st.toast("Alert sent.", icon="🔔")
@@ -410,13 +438,31 @@ def run_once(coin_id):
     # Log signal
     log_signal(label, idea["mood"], last_p, rsi_val, macd_hist, ns["score"], acc)
 
-    return snapshot
+    pbar.progress(100, text="✅ Done")
+    time.sleep(0.2)
+    pbar.empty()
+    return True
 
-# ---- Run
+# Persist alert settings
+def _persist_alerts_to_session():
+    for k in ["discord","tg_token","tg_chat","smtp_host","smtp_port","smtp_user","smtp_pass","smtp_from","smtp_to"]:
+        if k in st.session_state: continue  # don't overwrite
+    # no-op; values are written when user opens Alerts and interacts
+
 if run:
-    snap = run_once(coin_id)
+    # capture latest alert fields for session
+    st.session_state["discord"]=st.session_state.get("discord","")
+    st.session_state["tg_token"]=st.session_state.get("tg_token","")
+    st.session_state["tg_chat"]=st.session_state.get("tg_chat","")
+    st.session_state["smtp_host"]=st.session_state.get("smtp_host","")
+    st.session_state["smtp_port"]=st.session_state.get("smtp_port",587)
+    st.session_state["smtp_user"]=st.session_state.get("smtp_user","")
+    st.session_state["smtp_pass"]=st.session_state.get("smtp_pass","")
+    st.session_state["smtp_from"]=st.session_state.get("smtp_from","")
+    st.session_state["smtp_to"]=st.session_state.get("smtp_to","")
+    run_once(coin_id)
 
-# Auto-refresh
+# Auto-refresh (uses cached data/model for speed)
 if auto_refresh:
     if "last_auto" not in st.session_state: st.session_state["last_auto"]=0.0
     import time as _t
@@ -424,31 +470,3 @@ if auto_refresh:
     if now-st.session_state["last_auto"]>60:
         st.session_state["last_auto"]=now
         st.rerun()
-
-# ---- Quick Compare (last two runs)
-st.divider()
-st.subheader("Quick Compare (last two runs)")
-hist=st.session_state.get("compare_hist", [])
-if len(hist)<2:
-    st.caption("Run at least twice to compare.")
-else:
-    a,b=hist[-2], hist[-1]
-    col1,col2=st.columns(2)
-    with col1:
-        st.markdown(f"**Previous:** {a['coin']} @ {a['time'][:19]}Z")
-        st.metric("Signal", a["mood"].upper())
-        st.metric("Bullish Prob", f"{a['prob']*100:.1f}%")
-        st.metric("RSI(14)", f"{a['rsi']:.1f}")
-        st.metric("MACD Hist", f"{a['macd']:.5f}")
-        st.metric("News Score", f"{a['news']:+d}")
-        st.metric("Entry / Target / Stop", f"{a['entry']:.2f} / {a['target']:.2f} / {a['stop']:.2f}")
-        st.metric("Pos Size %", f"{a['size']*100:.1f}%")
-    with col2:
-        st.markdown(f"**Latest:** {b['coin']} @ {b['time'][:19]}Z")
-        st.metric("Signal", b["mood"].upper())
-        st.metric("Bullish Prob", f"{b['prob']*100:.1f}%")
-        st.metric("RSI(14)", f"{b['rsi']:.1f}")
-        st.metric("MACD Hist", f"{b['macd']:.5f}")
-        st.metric("News Score", f"{b['news']:+d}")
-        st.metric("Entry / Target / Stop", f"{b['entry']:.2f} / {b['target']:.2f} / {b['stop']:.2f}")
-        st.metric("Pos Size %", f"{b['size']*100:.1f}%")
